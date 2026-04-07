@@ -1,0 +1,31 @@
+name: win_http
+description: >-
+  A Windows HTTP client for package:http using the native WinHTTP API.
+  Provides system proxy support, Schannel TLS, and automatic decompression.
+  Requires Windows 8.1+.
+version: 0.1.0
+repository: https://github.com/edde746/win_http
+topics:
+  - http
+  - http-client
+  - windows
+  - winhttp
+  - ffi
+
+environment:
+  sdk: ^3.4.0
+
+platforms:
+  windows:
+
+dependencies:
+  http: ^1.2.0
+  ffi: ^2.1.0
+
+dev_dependencies:
+  lints: ^6.0.0
+  test: ^1.25.6
+  http_client_conformance_tests:
+    git:
+      url: https://github.com/dart-lang/http.git
+      path: pkgs/http_client_conformance_tests
