@@ -1,7 +1,3 @@
-// Copyright (c) 2024, the win_http authors. All rights reserved.
-// Use of this source code is governed by a BSD-style license that can be
-// found in the LICENSE file.
-
 import 'dart:async';
 import 'dart:ffi';
 
@@ -61,6 +57,14 @@ class WinHttpClientConfiguration {
   /// Only used when [accessType] is [WinHttpAccessType.named].
   final String? proxyBypass;
 
+  /// Maximum concurrent connections per server.
+  ///
+  /// WinHTTP defaults to 6 for HTTP/1.1, which can cause failures or
+  /// stalls when loading many resources (e.g., image thumbnails) from
+  /// the same host. Set higher for apps that make many concurrent requests.
+  /// Null uses WinHTTP's default (6).
+  final int? maxConnectionsPerServer;
+
   const WinHttpClientConfiguration({
     this.userAgent,
     this.resolveTimeout,
@@ -70,6 +74,7 @@ class WinHttpClientConfiguration {
     this.accessType = WinHttpAccessType.automatic,
     this.proxy,
     this.proxyBypass,
+    this.maxConnectionsPerServer,
   });
 }
 
@@ -156,6 +161,18 @@ class WinHttpClient extends BaseClient {
       dispatcher.close();
       WinHttpCloseHandle(hSession);
       throw WinHttpException(err, 'WinHttpSetStatusCallback');
+    }
+
+    // Enable HTTP/2 for connection multiplexing (Windows 10+, silent fallback).
+    trySetOption(hSession, WINHTTP_OPTION_ENABLE_HTTP_PROTOCOL,
+        WINHTTP_PROTOCOL_FLAG_HTTP2);
+
+    // Increase max connections per server if configured.
+    if (config.maxConnectionsPerServer != null) {
+      trySetOption(hSession, WINHTTP_OPTION_MAX_CONNS_PER_SERVER,
+          config.maxConnectionsPerServer!);
+      trySetOption(hSession, WINHTTP_OPTION_MAX_CONNS_PER_1_0_SERVER,
+          config.maxConnectionsPerServer!);
     }
 
     // Redirect policy is session-level.

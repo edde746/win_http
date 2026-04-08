@@ -72,6 +72,18 @@ const int WINHTTP_DISABLE_REDIRECTS = 0x00000002;
 const int INTERNET_DEFAULT_HTTP_PORT = 80;
 // ignore: constant_identifier_names
 const int INTERNET_DEFAULT_HTTPS_PORT = 443;
+// HTTP protocol flags for WINHTTP_OPTION_ENABLE_HTTP_PROTOCOL (Windows 10+).
+// ignore: constant_identifier_names
+const int WINHTTP_OPTION_ENABLE_HTTP_PROTOCOL = 133;
+// ignore: constant_identifier_names
+const int WINHTTP_PROTOCOL_FLAG_HTTP2 = 0x1;
+
+// Max connections per server (default is 6 for HTTP/1.1).
+// ignore: constant_identifier_names
+const int WINHTTP_OPTION_MAX_CONNS_PER_SERVER = 73;
+// ignore: constant_identifier_names
+const int WINHTTP_OPTION_MAX_CONNS_PER_1_0_SERVER = 74;
+
 // Async callback status constants for WinHttpSetStatusCallback.
 // Values from winhttp.h in the Windows SDK.
 // ignore: constant_identifier_names
