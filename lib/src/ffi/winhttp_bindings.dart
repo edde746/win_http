@@ -1,8 +1,8 @@
 /// Hand-written FFI bindings to winhttp.dll and kernel32.dll.
 ///
 /// Only the functions needed by this package are bound.
-/// All functions use `isLeaf: true` to prevent the Dart runtime from
-/// making system calls between our FFI call and GetLastError().
+/// In async mode, WinHTTP functions must NOT use `isLeaf: true` because
+/// they may invoke the status callback synchronously.
 library;
 
 // ignore_for_file: non_constant_identifier_names
@@ -45,7 +45,7 @@ final _WinHttpOpen = _winhttp.lookupFunction<
       Pointer<Utf16> pszProxyW,
       Pointer<Utf16> pszProxyBypassW,
       int dwFlags,
-    )>('WinHttpOpen', isLeaf: true);
+    )>('WinHttpOpen');
 
 /// Specifies the target server of an HTTP request.
 ///
@@ -70,7 +70,7 @@ final _WinHttpConnect = _winhttp.lookupFunction<
       Pointer<Utf16> pswzServerName,
       int nServerPort,
       int dwReserved,
-    )>('WinHttpConnect', isLeaf: true);
+    )>('WinHttpConnect');
 
 /// Creates an HTTP request handle.
 ///
@@ -105,7 +105,7 @@ final _WinHttpOpenRequest = _winhttp.lookupFunction<
       Pointer<Utf16> pwszReferrer,
       Pointer<Pointer<Utf16>> ppwszAcceptTypes,
       int dwFlags,
-    )>('WinHttpOpenRequest', isLeaf: true);
+    )>('WinHttpOpenRequest');
 
 /// Closes a single HINTERNET handle.
 ///
@@ -114,7 +114,7 @@ int WinHttpCloseHandle(int hInternet) => _WinHttpCloseHandle(hInternet);
 
 final _WinHttpCloseHandle = _winhttp.lookupFunction<
     Int32 Function(IntPtr hInternet),
-    int Function(int hInternet)>('WinHttpCloseHandle', isLeaf: true);
+    int Function(int hInternet)>('WinHttpCloseHandle');
 
 // ---------------------------------------------------------------------------
 // Request Configuration
@@ -144,7 +144,7 @@ final _WinHttpAddRequestHeaders = _winhttp.lookupFunction<
       Pointer<Utf16> lpszHeaders,
       int dwHeadersLength,
       int dwModifiers,
-    )>('WinHttpAddRequestHeaders', isLeaf: true);
+    )>('WinHttpAddRequestHeaders');
 
 /// Sets an option on an HINTERNET handle.
 ///
@@ -169,7 +169,7 @@ final _WinHttpSetOption = _winhttp.lookupFunction<
       int dwOption,
       Pointer<Void> lpBuffer,
       int dwBufferLength,
-    )>('WinHttpSetOption', isLeaf: true);
+    )>('WinHttpSetOption');
 
 /// Queries an option on an HINTERNET handle.
 ///
@@ -194,7 +194,7 @@ final _WinHttpQueryOption = _winhttp.lookupFunction<
       int dwOption,
       Pointer<Void> lpBuffer,
       Pointer<Uint32> lpdwBufferLength,
-    )>('WinHttpQueryOption', isLeaf: true);
+    )>('WinHttpQueryOption');
 
 /// Sets timeout values for the resolve, connect, send, and receive operations.
 ///
@@ -223,7 +223,7 @@ final _WinHttpSetTimeouts = _winhttp.lookupFunction<
       int nConnectTimeout,
       int nSendTimeout,
       int nReceiveTimeout,
-    )>('WinHttpSetTimeouts', isLeaf: true);
+    )>('WinHttpSetTimeouts');
 
 // ---------------------------------------------------------------------------
 // Sending Request & Body
@@ -340,7 +340,7 @@ final _WinHttpQueryHeaders = _winhttp.lookupFunction<
       Pointer<Void> lpBuffer,
       Pointer<Uint32> lpdwBufferLength,
       Pointer<Uint32> lpdwIndex,
-    )>('WinHttpQueryHeaders', isLeaf: true);
+    )>('WinHttpQueryHeaders');
 
 /// Returns the amount of data, in bytes, available to be read.
 ///
@@ -386,6 +386,58 @@ final _WinHttpReadData = _winhttp.lookupFunction<
       int dwNumberOfBytesToRead,
       Pointer<Uint32> lpdwNumberOfBytesRead,
     )>('WinHttpReadData');
+
+// ---------------------------------------------------------------------------
+// Async Callback Support
+// ---------------------------------------------------------------------------
+
+/// Native function type for WINHTTP_STATUS_CALLBACK.
+typedef WinHttpStatusCallbackNative = Void Function(
+  IntPtr hInternet,
+  IntPtr dwContext,
+  Uint32 dwInternetStatus,
+  Pointer<Void> lpvStatusInformation,
+  Uint32 dwStatusInformationLength,
+);
+
+/// The WINHTTP_ASYNC_RESULT structure, pointed to by lpvStatusInformation
+/// when the callback status is WINHTTP_CALLBACK_STATUS_REQUEST_ERROR.
+// ignore: camel_case_types
+final class WINHTTP_ASYNC_RESULT extends Struct {
+  @IntPtr()
+  external int dwResult;
+
+  @Uint32()
+  external int dwError;
+}
+
+/// Registers a callback function for async status notifications.
+///
+/// Returns the previous callback, or WINHTTP_INVALID_STATUS_CALLBACK on error.
+Pointer<NativeFunction<WinHttpStatusCallbackNative>> WinHttpSetStatusCallback(
+  int hInternet,
+  Pointer<NativeFunction<WinHttpStatusCallbackNative>> lpfnInternetCallback,
+  int dwNotificationFlags,
+  int dwReserved,
+) =>
+    _WinHttpSetStatusCallback(
+        hInternet, lpfnInternetCallback, dwNotificationFlags, dwReserved);
+
+final _WinHttpSetStatusCallback = _winhttp.lookupFunction<
+    Pointer<NativeFunction<WinHttpStatusCallbackNative>> Function(
+      IntPtr hInternet,
+      Pointer<NativeFunction<WinHttpStatusCallbackNative>>
+          lpfnInternetCallback,
+      Uint32 dwNotificationFlags,
+      IntPtr dwReserved,
+    ),
+    Pointer<NativeFunction<WinHttpStatusCallbackNative>> Function(
+      int hInternet,
+      Pointer<NativeFunction<WinHttpStatusCallbackNative>>
+          lpfnInternetCallback,
+      int dwNotificationFlags,
+      int dwReserved,
+    )>('WinHttpSetStatusCallback');
 
 // ---------------------------------------------------------------------------
 // Error Handling (kernel32.dll)

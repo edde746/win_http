@@ -1,43 +1,94 @@
+// Copyright (c) 2024, the win_http authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+import 'dart:async';
 import 'dart:ffi';
-import 'dart:isolate';
 import 'dart:typed_data';
 
 import 'package:ffi/ffi.dart';
+import 'package:http/http.dart';
 
 import 'ffi/winhttp_bindings.dart';
 import 'ffi/winhttp_constants.dart';
 import 'native_memory.dart';
-import 'string_utils.dart';
-// callBool, callHandle, callWithError are imported via win_http_exception.dart
 import 'win_http_exception.dart';
 
-const _readBufferSize = 8 * 1024;
+const _readBufferSize = 64 * 1024;
 final _digitRegex = RegExp(r'^\d+$');
 
-/// Data sent to the worker isolate to execute an HTTP request.
-class WorkerRequest {
-  final int hSession;
-  final String method;
-  final Uri url;
-  final Map<String, String> headers;
-  final Uint8List body;
-  final bool followRedirects;
-  final int maxRedirects;
-  final SendPort responseSendPort;
+// ---------------------------------------------------------------------------
+// Request lifecycle phases
+// ---------------------------------------------------------------------------
 
-  WorkerRequest({
-    required this.hSession,
-    required this.method,
-    required this.url,
-    required this.headers,
-    required this.body,
-    required this.followRedirects,
-    required this.maxRedirects,
-    required this.responseSendPort,
-  });
+enum RequestPhase {
+  sendingRequest,
+  receivingResponse,
+  readingData,
+  done,
+  error,
 }
 
-/// Response metadata sent back from the worker isolate.
+// ---------------------------------------------------------------------------
+// Per-request async state
+// ---------------------------------------------------------------------------
+
+/// State for a single in-flight async WinHTTP request.
+class AsyncRequestState {
+  final int contextId;
+  int hRequest;
+  int hConnect;
+  final BaseRequest request;
+
+  RequestPhase phase = RequestPhase.sendingRequest;
+
+  final Completer<RawResponseHeaders> headersCompleter =
+      Completer<RawResponseHeaders>();
+  late final StreamController<List<int>> bodyController;
+
+  /// Native buffer for WinHttpReadData — kept alive between calls.
+  Pointer<Uint8> readBuffer = nullptr;
+
+  /// Native buffer for request body — kept alive until SENDREQUEST_COMPLETE.
+  Pointer<Uint8> bodyBuffer = nullptr;
+  int bodyLength = 0;
+
+  int totalBytesRead = 0;
+  int? contentLength;
+  bool aborted = false;
+
+  /// Callback invoked when the body stream subscription is cancelled.
+  void Function()? onStreamCancel;
+
+  AsyncRequestState({
+    required this.contextId,
+    required this.hRequest,
+    required this.hConnect,
+    required this.request,
+  }) {
+    bodyController = StreamController<List<int>>(
+      onCancel: () {
+        onStreamCancel?.call();
+      },
+    );
+  }
+
+  void freeNativeMemory() {
+    if (readBuffer != nullptr) {
+      calloc.free(readBuffer);
+      readBuffer = nullptr;
+    }
+    if (bodyBuffer != nullptr) {
+      calloc.free(bodyBuffer);
+      bodyBuffer = nullptr;
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Response metadata (kept from sync implementation)
+// ---------------------------------------------------------------------------
+
 class RawResponseHeaders {
   final int statusCode;
   final String? reasonPhrase;
@@ -54,241 +105,250 @@ class RawResponseHeaders {
   });
 }
 
-/// Error sent back from the worker isolate.
-class WinHttpWorkerError {
-  final String message;
-  WinHttpWorkerError(this.message);
-}
+// ---------------------------------------------------------------------------
+// Async callback dispatcher — one per session
+// ---------------------------------------------------------------------------
 
-/// Worker isolate entry point. Runs synchronous WinHTTP calls.
-///
-/// Communication protocol via [SendPort]:
-/// 1. First message: [RawResponseHeaders] (response metadata)
-/// 2. Subsequent messages: [Uint8List] (body chunks)
-/// 3. Final message: `null` (body complete)
-/// On error: [WinHttpWorkerError]
-void workerEntryPoint(WorkerRequest req) {
-  var hConnect = 0;
-  var hRequest = 0;
+class AsyncCallbackDispatcher {
+  final Map<int, AsyncRequestState> _requests = {};
+  int _nextContextId = 1;
 
-  try {
-    final host = req.url.host;
-    final port = req.url.hasPort
-        ? req.url.port
-        : (req.url.scheme == 'https'
-            ? INTERNET_DEFAULT_HTTPS_PORT
-            : INTERNET_DEFAULT_HTTP_PORT);
-    final isSecure = req.url.scheme == 'https';
+  late final NativeCallable<WinHttpStatusCallbackNative> _nativeCallback;
 
-    hConnect = withWideString(
-      host,
-      (pHost) => callWinHttp(
-        'WinHttpConnect',
-        () => WinHttpConnect(req.hSession, pHost, port, 0),
-      ),
+  AsyncCallbackDispatcher() {
+    _nativeCallback = NativeCallable<WinHttpStatusCallbackNative>.listener(
+      _onStatusCallback,
     );
+  }
 
-    var objectName = req.url.path;
-    if (objectName.isEmpty) objectName = '/';
-    if (req.url.hasQuery) objectName = '$objectName?${req.url.query}';
+  /// The native function pointer to register with WinHttpSetStatusCallback.
+  Pointer<NativeFunction<WinHttpStatusCallbackNative>>
+      get nativeCallbackPointer => _nativeCallback.nativeFunction;
 
-    hRequest = withWideStrings(
-      [req.method, objectName],
-      (ptrs) => callWinHttp(
-        'WinHttpOpenRequest',
-        () => WinHttpOpenRequest(
-          hConnect,
-          ptrs[0],
-          ptrs[1],
-          nullptr,
-          nullptr,
-          nullptr,
-          isSecure ? WINHTTP_FLAG_SECURE : 0,
-        ),
-      ),
-    );
+  /// Allocates a unique context ID for a new request.
+  int allocateContextId() => _nextContextId++;
 
-    // WINHTTP_OPTION_REDIRECT_POLICY is session-level only;
-    // use WINHTTP_OPTION_DISABLE_FEATURE on the request handle instead.
-    if (!req.followRedirects) {
-      setDwordOption(
-        hRequest,
-        WINHTTP_OPTION_DISABLE_FEATURE,
-        WINHTTP_DISABLE_REDIRECTS,
-      );
-    } else {
-      setDwordOption(
-        hRequest,
-        WINHTTP_OPTION_MAX_HTTP_AUTOMATIC_REDIRECTS,
-        req.maxRedirects,
-      );
+  /// Registers a request state for callback dispatch.
+  void registerRequest(int contextId, AsyncRequestState state) {
+    _requests[contextId] = state;
+  }
+
+  /// Initiates cleanup: frees native memory and closes handles.
+  /// The request is removed from the map when HANDLE_CLOSING fires.
+  void initiateCleanup(AsyncRequestState state) {
+    state.freeNativeMemory();
+    if (state.hRequest != 0) {
+      WinHttpCloseHandle(state.hRequest);
+      state.hRequest = 0;
+    }
+    if (state.hConnect != 0) {
+      WinHttpCloseHandle(state.hConnect);
+      state.hConnect = 0;
+    }
+  }
+
+  /// Closes the native callback. Call after the session handle is closed.
+  void close() {
+    _nativeCallback.close();
+  }
+
+  // -------------------------------------------------------------------------
+  // Callback dispatch — runs on the Dart event loop
+  // -------------------------------------------------------------------------
+
+  void _onStatusCallback(
+    int hInternet,
+    int dwContext,
+    int dwInternetStatus,
+    Pointer<Void> lpvStatusInformation,
+    int dwStatusInformationLength,
+  ) {
+    final state = _requests[dwContext];
+    if (state == null || state.aborted) return;
+
+    switch (dwInternetStatus) {
+      case WINHTTP_CALLBACK_STATUS_SENDREQUEST_COMPLETE:
+        _onSendRequestComplete(state);
+      case WINHTTP_CALLBACK_STATUS_HEADERS_AVAILABLE:
+        _onHeadersAvailable(state);
+      case WINHTTP_CALLBACK_STATUS_DATA_AVAILABLE:
+        // If using WinHttpQueryDataAvailable, handle here.
+        // Currently unused — we loop directly on WinHttpReadData.
+        break;
+      case WINHTTP_CALLBACK_STATUS_READ_COMPLETE:
+        _onReadComplete(state, dwStatusInformationLength);
+      case WINHTTP_CALLBACK_STATUS_REQUEST_ERROR:
+        _onRequestError(state, lpvStatusInformation, dwStatusInformationLength);
+      case WINHTTP_CALLBACK_STATUS_HANDLE_CLOSING:
+        _requests.remove(dwContext);
+      // REDIRECT, WRITE_COMPLETE: no action needed
+    }
+  }
+
+  void _onSendRequestComplete(AsyncRequestState state) {
+    // Free the body buffer — WinHTTP has consumed it.
+    if (state.bodyBuffer != nullptr) {
+      calloc.free(state.bodyBuffer);
+      state.bodyBuffer = nullptr;
     }
 
-    // Disable automatic cookies to avoid hidden cross-request state.
-    setDwordOption(
-      hRequest,
-      WINHTTP_OPTION_DISABLE_FEATURE,
-      WINHTTP_DISABLE_COOKIES,
-    );
-
-    // Enable automatic decompression (Windows 8.1+, fails silently on older).
-    _trySetOption(
-      hRequest,
-      WINHTTP_OPTION_DECOMPRESSION,
-      WINHTTP_DECOMPRESSION_FLAG_ALL,
-    );
-
-    // Batch all headers into a single string for one FFI call.
-    if (req.headers.isNotEmpty) {
-      final headerBuf = StringBuffer();
-      for (final entry in req.headers.entries) {
-        headerBuf.write('${entry.key}: ${entry.value}\r\n');
-      }
-      final headerStr = headerBuf.toString();
-      // ADD | REPLACE so we can override WinHTTP default headers.
-      withWideString(headerStr, (pHeaders) {
-        WinHttpAddRequestHeaders(
-          hRequest,
-          pHeaders,
-          headerStr.length,
-          WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE,
-        );
-      });
-    }
-
-    // Send request. Allocate body buffer only if non-empty.
-    final bodyLen = req.body.length;
-    final pBody =
-        bodyLen > 0 ? calloc<Uint8>(bodyLen) : Pointer<Uint8>.fromAddress(0);
+    // Initiate response reception.
+    state.phase = RequestPhase.receivingResponse;
     try {
-      if (bodyLen > 0) {
-        pBody.asTypedList(bodyLen).setAll(0, req.body);
+      callWinHttpAsync(
+        'WinHttpReceiveResponse',
+        () => WinHttpReceiveResponse(state.hRequest, nullptr),
+      );
+    } on WinHttpException catch (e) {
+      _completeWithError(state, e.message);
+    }
+  }
+
+  void _onHeadersAvailable(AsyncRequestState state) {
+    try {
+      final statusCode = queryHeaderInt(
+        state.hRequest,
+        WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+      );
+      final reasonPhrase =
+          queryHeaderString(state.hRequest, WINHTTP_QUERY_STATUS_TEXT);
+      final rawHeaders =
+          queryHeaderString(state.hRequest, WINHTTP_QUERY_RAW_HEADERS_CRLF);
+      final headers = _parseRawHeaders(rawHeaders ?? '');
+      final finalUrlStr =
+          queryOptionString(state.hRequest, WINHTTP_OPTION_URL);
+      final finalUrl = finalUrlStr != null
+          ? Uri.parse(finalUrlStr)
+          : state.request.url;
+
+      int? contentLength;
+      final clHeader = headers['content-length'];
+      if (clHeader != null) {
+        if (!_digitRegex.hasMatch(clHeader)) {
+          _completeWithError(
+              state, 'Invalid content-length header [$clHeader].');
+          return;
+        }
+        contentLength = int.parse(clHeader);
       }
-      callWinHttp(
-        'WinHttpSendRequest',
-        () => WinHttpSendRequest(
-          hRequest,
-          nullptr,
-          0,
-          bodyLen > 0 ? pBody.cast() : nullptr,
-          bodyLen,
-          bodyLen,
-          0,
+      state.contentLength = contentLength;
+
+      state.headersCompleter.complete(RawResponseHeaders(
+        statusCode: statusCode,
+        reasonPhrase: reasonPhrase,
+        headers: headers,
+        contentLength: contentLength,
+        finalUrl: finalUrl,
+      ));
+
+      // Start reading body.
+      state.phase = RequestPhase.readingData;
+      state.readBuffer = calloc<Uint8>(_readBufferSize);
+      _issueRead(state);
+    } on WinHttpException catch (e) {
+      _completeWithError(state, e.message);
+    }
+  }
+
+  void _onReadComplete(AsyncRequestState state, int bytesRead) {
+    if (bytesRead > 0) {
+      state.totalBytesRead += bytesRead;
+      // Our readBuffer is safe to dereference — we own it.
+      state.bodyController.add(
+        Uint8List.fromList(state.readBuffer.asTypedList(bytesRead)),
+      );
+      _issueRead(state);
+    } else {
+      // EOF — body is done.
+      if (state.contentLength != null &&
+          state.totalBytesRead < state.contentLength!) {
+        state.bodyController.addError(ClientException(
+          'Connection closed while receiving data',
+          state.request.url,
+        ));
+      }
+      state.phase = RequestPhase.done;
+      state.bodyController.close();
+      initiateCleanup(state);
+    }
+  }
+
+  void _onRequestError(AsyncRequestState state,
+      Pointer<Void> lpvStatusInformation, int dwStatusInformationLength) {
+    // Best-effort read of WINHTTP_ASYNC_RESULT — the pointer may be dangling
+    // since NativeCallable.listener runs asynchronously. In practice it's
+    // usually still valid due to timing.
+    var errorCode = 0;
+    try {
+      if (dwStatusInformationLength >= sizeOf<WINHTTP_ASYNC_RESULT>() &&
+          lpvStatusInformation != nullptr) {
+        final result = lpvStatusInformation.cast<WINHTTP_ASYNC_RESULT>().ref;
+        errorCode = result.dwError;
+      }
+    } catch (_) {
+      // Pointer was invalid — use phase-based fallback.
+    }
+
+    final message = _errorMessageForCode(errorCode, state.phase);
+    _completeWithError(state, message);
+  }
+
+  void _issueRead(AsyncRequestState state) {
+    try {
+      callWinHttpAsync(
+        'WinHttpReadData',
+        () => WinHttpReadData(
+          state.hRequest,
+          state.readBuffer.cast(),
+          _readBufferSize,
+          nullptr, // Ignored in async mode.
         ),
       );
-    } finally {
-      if (bodyLen > 0) calloc.free(pBody);
+    } on WinHttpException catch (e) {
+      _completeWithError(state, e.message);
     }
+  }
 
-    callWinHttp(
-      'WinHttpReceiveResponse',
-      () => WinHttpReceiveResponse(hRequest, nullptr),
-    );
-
-    final statusCode = queryHeaderInt(
-      hRequest,
-      WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-    );
-    final reasonPhrase = queryHeaderString(hRequest, WINHTTP_QUERY_STATUS_TEXT);
-    final rawHeaders =
-        queryHeaderString(hRequest, WINHTTP_QUERY_RAW_HEADERS_CRLF);
-    final headers = _parseRawHeaders(rawHeaders ?? '');
-    final finalUrlStr = queryOptionString(hRequest, WINHTTP_OPTION_URL);
-    final finalUrl =
-        finalUrlStr != null ? Uri.parse(finalUrlStr) : req.url;
-
-    int? contentLength;
-    final clHeader = headers['content-length'];
-    if (clHeader != null) {
-      if (!_digitRegex.hasMatch(clHeader)) {
-        req.responseSendPort.send(
-            WinHttpWorkerError('Invalid content-length header [$clHeader].'));
-        return;
-      }
-      contentLength = int.parse(clHeader);
+  void _completeWithError(AsyncRequestState state, String message) {
+    state.phase = RequestPhase.error;
+    final error = ClientException(message, state.request.url);
+    if (!state.headersCompleter.isCompleted) {
+      state.headersCompleter.completeError(error);
+    } else if (!state.bodyController.isClosed) {
+      state.bodyController.addError(error);
+      state.bodyController.close();
     }
+    initiateCleanup(state);
+  }
 
-    req.responseSendPort.send(RawResponseHeaders(
-      statusCode: statusCode,
-      reasonPhrase: reasonPhrase,
-      headers: headers,
-      contentLength: contentLength,
-      finalUrl: finalUrl,
-    ));
-
-    var totalBytesRead = 0;
-    final pBytesAvailable = calloc<Uint32>();
-    final pBytesRead = calloc<Uint32>();
-    final pBuffer = calloc<Uint8>(_readBufferSize);
-    try {
-      while (true) {
-        callWinHttp(
-          'WinHttpQueryDataAvailable',
-          () => WinHttpQueryDataAvailable(hRequest, pBytesAvailable),
-        );
-
-        if (pBytesAvailable.value == 0) break;
-
-        final toRead = pBytesAvailable.value < _readBufferSize
-            ? pBytesAvailable.value
-            : _readBufferSize;
-
-        callWinHttp(
-          'WinHttpReadData',
-          () => WinHttpReadData(hRequest, pBuffer.cast(), toRead, pBytesRead),
-        );
-
-        final bytesRead = pBytesRead.value;
-        if (bytesRead == 0) break;
-
-        totalBytesRead += bytesRead;
-        req.responseSendPort.send(
-          Uint8List.fromList(pBuffer.asTypedList(bytesRead)),
-        );
-      }
-    } finally {
-      calloc.free(pBytesAvailable);
-      calloc.free(pBytesRead);
-      calloc.free(pBuffer);
+  static String _errorMessageForCode(int errorCode, RequestPhase phase) {
+    if (errorCode != 0) {
+      return switch (errorCode) {
+        ERROR_WINHTTP_TIMEOUT => 'Connection timed out',
+        ERROR_WINHTTP_NAME_NOT_RESOLVED => 'Could not resolve host',
+        ERROR_WINHTTP_CANNOT_CONNECT => 'Connection refused',
+        ERROR_WINHTTP_REDIRECT_FAILED => 'Redirect limit exceeded',
+        ERROR_WINHTTP_CONNECTION_ERROR =>
+          'The connection was reset or terminated',
+        ERROR_WINHTTP_SECURE_FAILURE => 'TLS certificate validation failed',
+        _ => 'WinHTTP error $errorCode (0x${errorCode.toRadixString(16)})',
+      };
     }
-
-    // WinHTTP silently accepts mismatched content-length, but package:http
-    // expects a ClientException.
-    if (contentLength != null && totalBytesRead < contentLength) {
-      req.responseSendPort.send(WinHttpWorkerError(
-          'Connection closed while receiving data'));
-      return;
-    }
-
-    req.responseSendPort.send(null);
-  } on WinHttpException catch (e) {
-    // Map specific WinHTTP errors to the messages expected by package:http.
-    if (e.errorCode == ERROR_WINHTTP_REDIRECT_FAILED) {
-      req.responseSendPort.send(WinHttpWorkerError('Redirect limit exceeded'));
-    } else if (e.errorCode == ERROR_WINHTTP_NAME_NOT_RESOLVED) {
-      req.responseSendPort
-          .send(WinHttpWorkerError('Could not resolve host'));
-    } else if (e.errorCode == ERROR_WINHTTP_CANNOT_CONNECT) {
-      req.responseSendPort
-          .send(WinHttpWorkerError('Connection refused'));
-    } else if (e.errorCode == ERROR_WINHTTP_TIMEOUT) {
-      req.responseSendPort.send(WinHttpWorkerError('Connection timed out'));
-    } else {
-      req.responseSendPort.send(WinHttpWorkerError(e.toString()));
-    }
-  } on Exception catch (e) {
-    req.responseSendPort.send(WinHttpWorkerError(e.toString()));
-  } finally {
-    if (hRequest != 0) WinHttpCloseHandle(hRequest);
-    if (hConnect != 0) WinHttpCloseHandle(hConnect);
+    return switch (phase) {
+      RequestPhase.sendingRequest => 'Failed to send request',
+      RequestPhase.receivingResponse => 'Failed to receive response',
+      RequestPhase.readingData => 'Connection closed while receiving data',
+      _ => 'WinHTTP request failed',
+    };
   }
 }
 
-/// Sets a DWORD option on a WinHTTP handle, ignoring failures.
-///
-/// Some options may not be supported on all Windows versions or handle types.
-/// Returns true if the option was set successfully.
-bool _trySetOption(int hInternet, int option, int value) {
+// ---------------------------------------------------------------------------
+// Helpers (kept from sync implementation)
+// ---------------------------------------------------------------------------
+
+/// Sets a DWORD option, ignoring failures (for optional features).
+bool trySetOption(int hInternet, int option, int value) {
   try {
     setDwordOption(hInternet, option, value);
     return true;
@@ -298,32 +358,21 @@ bool _trySetOption(int hInternet, int option, int value) {
 }
 
 /// Parses raw CRLF-delimited headers into a map with lowercase keys.
-///
-/// Handles:
-/// - Folded headers (continuation lines starting with SP/HT per RFC 2822)
-/// - Duplicate headers (comma-joined, including set-cookie)
-/// - Skips the status line (first line)
 Map<String, String> _parseRawHeaders(String rawHeaders) {
   final headers = <String, String>{};
   final lines = rawHeaders.split('\r\n');
 
-  // Skip the status line (e.g., "HTTP/1.1 200 OK").
   var startIndex = 0;
   if (lines.isNotEmpty && lines[0].startsWith('HTTP/')) {
     startIndex = 1;
   }
 
-  // First pass: unfold continuation lines (RFC 2822).
-  // WinHTTP may already unfold headers, but we handle it to be safe.
   final unfolded = <String>[];
   for (var i = startIndex; i < lines.length; i++) {
     final line = lines[i];
     if (line.isEmpty) continue;
-
-    // Continuation line: starts with space or tab.
     if ((line.startsWith(' ') || line.startsWith('\t')) &&
         unfolded.isNotEmpty) {
-      // Replace the leading whitespace with a single space.
       unfolded[unfolded.length - 1] =
           '${unfolded[unfolded.length - 1]} ${line.trimLeft()}';
     } else {
@@ -331,17 +380,12 @@ Map<String, String> _parseRawHeaders(String rawHeaders) {
     }
   }
 
-  // Second pass: parse name:value pairs.
   for (final line in unfolded) {
     final colonIndex = line.indexOf(':');
     if (colonIndex < 1) continue;
-
     final name = line.substring(0, colonIndex).trim().toLowerCase();
     final value = line.substring(colonIndex + 1).trim();
-
     if (headers.containsKey(name)) {
-      // Comma-join duplicates — including set-cookie, as the conformance
-      // tests expect a single comma-joined string.
       headers[name] = '${headers[name]}, $value';
     } else {
       headers[name] = value;

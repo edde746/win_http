@@ -1,7 +1,11 @@
-import 'dart:async';
-import 'dart:isolate';
-import 'dart:typed_data';
+// Copyright (c) 2024, the win_http authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
 
+import 'dart:async';
+import 'dart:ffi';
+
+import 'package:ffi/ffi.dart';
 import 'package:http/http.dart';
 
 import 'ffi/winhttp_bindings.dart';
@@ -91,19 +95,10 @@ class _StreamedResponseWithUrl extends StreamedResponse
 /// [WinHTTP](https://learn.microsoft.com/en-us/windows/win32/winhttp/about-winhttp)
 /// API.
 ///
-/// This client uses synchronous WinHTTP calls on worker isolates to avoid
-/// blocking the main isolate's event loop.
+/// Uses async WinHTTP with native callbacks — no isolate spawning overhead.
+/// All requests run on the main Dart isolate via `NativeCallable.listener`.
 ///
-/// **Platform**: Windows 8.1+ (required for automatic decompression and
-/// automatic proxy detection).
-///
-/// **Limitations**:
-/// - Request bodies are materialized in memory before sending (no streaming).
-/// - Abort is not supported in v0.1 (synchronous WinHTTP cannot be safely
-///   cancelled from another isolate).
-/// - Headers added via `WinHttpAddRequestHeaders` are transferred across
-///   redirects, which means sensitive headers like `Authorization` could leak
-///   on cross-origin redirect hops.
+/// **Platform**: Windows 8.1+.
 ///
 /// Example:
 /// ```dart
@@ -117,9 +112,11 @@ class _StreamedResponseWithUrl extends StreamedResponse
 /// ```
 class WinHttpClient extends BaseClient {
   int? _hSession;
+  AsyncCallbackDispatcher? _dispatcher;
   int _pendingRequests = 0;
+  bool _closePending = false;
 
-  WinHttpClient._(this._hSession);
+  WinHttpClient._(this._hSession, this._dispatcher);
 
   /// Creates a [WinHttpClient] with default configuration.
   factory WinHttpClient.defaultConfiguration() =>
@@ -138,20 +135,36 @@ class WinHttpClient extends BaseClient {
           config.accessType.value,
           ptrs[1],
           ptrs[2],
-          0, // Synchronous mode
+          WINHTTP_FLAG_ASYNC,
         ),
       ),
     );
 
-    // Set redirect policy to ALWAYS on the session handle.
-    // Per-request redirect control uses WINHTTP_OPTION_DISABLE_FEATURE.
+    // Create callback dispatcher and register on the session.
+    final dispatcher = AsyncCallbackDispatcher();
+    // Subscribe to all notifications — WinHTTP may fire intermediate statuses
+    // (RESOLVING_NAME, CONNECTING_TO_SERVER, etc.) that block progress if
+    // not subscribed.
+    final prevCallback = WinHttpSetStatusCallback(
+      hSession,
+      dispatcher.nativeCallbackPointer,
+      0xFFFFFFFF, // WINHTTP_CALLBACK_FLAG_ALL_NOTIFICATIONS
+      0,
+    );
+    if (prevCallback.address == WINHTTP_INVALID_STATUS_CALLBACK) {
+      final err = GetLastError();
+      dispatcher.close();
+      WinHttpCloseHandle(hSession);
+      throw WinHttpException(err, 'WinHttpSetStatusCallback');
+    }
+
+    // Redirect policy is session-level.
     setDwordOption(
       hSession,
       WINHTTP_OPTION_REDIRECT_POLICY,
       WINHTTP_OPTION_REDIRECT_POLICY_ALWAYS,
     );
 
-    // Configure timeouts if specified.
     if (config.resolveTimeout != null ||
         config.connectTimeout != null ||
         config.sendTimeout != null ||
@@ -168,18 +181,20 @@ class WinHttpClient extends BaseClient {
           ),
         );
       } on WinHttpException {
+        dispatcher.close();
         WinHttpCloseHandle(hSession);
         rethrow;
       }
     }
 
-    return WinHttpClient._(hSession);
+    return WinHttpClient._(hSession, dispatcher);
   }
 
   @override
   Future<StreamedResponse> send(BaseRequest request) async {
     final hSession = _hSession;
-    if (hSession == null || _closePending) {
+    final dispatcher = _dispatcher;
+    if (hSession == null || dispatcher == null || _closePending) {
       throw ClientException(
         'HTTP request failed. Client is already closed.',
         request.url,
@@ -191,81 +206,163 @@ class WinHttpClient extends BaseClient {
     final stream = request.finalize();
     final body = await stream.toBytes();
 
-    final responseHeadersCompleter = Completer<RawResponseHeaders>();
-    final responseController = StreamController<List<int>>();
-    final receivePort = ReceivePort();
-    var aborted = false;
+    // Open connection and request handles (synchronous in async mode too).
+    final host = request.url.host;
+    final port = request.url.hasPort
+        ? request.url.port
+        : (request.url.scheme == 'https'
+            ? INTERNET_DEFAULT_HTTPS_PORT
+            : INTERNET_DEFAULT_HTTP_PORT);
 
-    receivePort.listen((message) {
-      if (aborted) return; // Discard messages after abort.
-      if (message is RawResponseHeaders) {
-        responseHeadersCompleter.complete(message);
-      } else if (message is Uint8List) {
-        responseController.add(message);
-      } else if (message == null) {
-        responseController.close();
-        receivePort.close();
-      } else if (message is WinHttpWorkerError) {
-        final error = ClientException(message.message, request.url);
-        if (!responseHeadersCompleter.isCompleted) {
-          responseHeadersCompleter.completeError(error);
-        } else {
-          responseController.addError(error);
-        }
-        responseController.close();
-        receivePort.close();
-      }
-    });
-
-    await Isolate.spawn(
-      workerEntryPoint,
-      WorkerRequest(
-        hSession: hSession,
-        method: request.method,
-        url: request.url,
-        headers: request.headers,
-        body: body,
-        followRedirects: request.followRedirects,
-        maxRedirects: request.maxRedirects,
-        responseSendPort: receivePort.sendPort,
-      ),
-    );
-
-    // Handle abort. We can't cancel the WinHTTP call in the worker isolate,
-    // but we can inject the error into the stream and close the receive port.
-    // The worker isolate will finish its work but the results are discarded.
-    if (request case Abortable(:final abortTrigger?)) {
-      unawaited(abortTrigger.whenComplete(() {
-        aborted = true;
-        final error = RequestAbortedException(request.url);
-        if (!responseHeadersCompleter.isCompleted) {
-          responseHeadersCompleter.completeError(error);
-        } else if (!responseController.isClosed) {
-          responseController.addError(error);
-          responseController.close();
-        }
-        receivePort.close();
-      }));
-    }
-
-    final RawResponseHeaders rawHeaders;
+    int hConnect;
     try {
-      rawHeaders = await responseHeadersCompleter.future;
+      hConnect = withWideString(
+        host,
+        (pHost) => callWinHttp(
+          'WinHttpConnect',
+          () => WinHttpConnect(hSession, pHost, port, 0),
+        ),
+      );
     } catch (_) {
       _pendingRequests--;
-      receivePort.close();
-      unawaited(responseController.close());
       rethrow;
     }
 
-    final statusCode = rawHeaders.statusCode;
-    final isRedirect = !request.followRedirects &&
-        statusCode >= 300 &&
-        statusCode < 400;
+    int hRequest;
+    try {
+      var objectName = request.url.path;
+      if (objectName.isEmpty) objectName = '/';
+      if (request.url.hasQuery) objectName = '$objectName?${request.url.query}';
 
-    // Track when the response stream finishes so we can safely close
-    // the session handle even if close() is called during a request.
-    unawaited(responseController.done.then((_) {
+      hRequest = withWideStrings(
+        [request.method, objectName],
+        (ptrs) => callWinHttp(
+          'WinHttpOpenRequest',
+          () => WinHttpOpenRequest(
+            hConnect,
+            ptrs[0],
+            ptrs[1],
+            nullptr,
+            nullptr,
+            nullptr,
+            request.url.scheme == 'https' ? WINHTTP_FLAG_SECURE : 0,
+          ),
+        ),
+      );
+    } catch (_) {
+      WinHttpCloseHandle(hConnect);
+      _pendingRequests--;
+      rethrow;
+    }
+
+    // Configure request options (synchronous).
+    if (!request.followRedirects) {
+      setDwordOption(
+          hRequest, WINHTTP_OPTION_DISABLE_FEATURE, WINHTTP_DISABLE_REDIRECTS);
+    } else {
+      setDwordOption(hRequest, WINHTTP_OPTION_MAX_HTTP_AUTOMATIC_REDIRECTS,
+          request.maxRedirects);
+    }
+    setDwordOption(
+        hRequest, WINHTTP_OPTION_DISABLE_FEATURE, WINHTTP_DISABLE_COOKIES);
+    trySetOption(
+        hRequest, WINHTTP_OPTION_DECOMPRESSION, WINHTTP_DECOMPRESSION_FLAG_ALL);
+
+    // Batch headers.
+    if (request.headers.isNotEmpty) {
+      final headerBuf = StringBuffer();
+      for (final entry in request.headers.entries) {
+        headerBuf.write('${entry.key}: ${entry.value}\r\n');
+      }
+      final headerStr = headerBuf.toString();
+      withWideString(headerStr, (pHeaders) {
+        WinHttpAddRequestHeaders(hRequest, pHeaders, headerStr.length,
+            WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE);
+      });
+    }
+
+    // Create async request state.
+    final contextId = dispatcher.allocateContextId();
+    final state = AsyncRequestState(
+      contextId: contextId,
+      hRequest: hRequest,
+      hConnect: hConnect,
+      request: request,
+    );
+    dispatcher.registerRequest(contextId, state);
+
+    // When the consumer cancels the response stream subscription, abort
+    // the WinHTTP request by closing the handle.
+    state.onStreamCancel = () {
+      if (!state.aborted && state.phase == RequestPhase.readingData) {
+        state.aborted = true;
+        state.freeNativeMemory();
+        if (state.hRequest != 0) {
+          WinHttpCloseHandle(state.hRequest);
+          state.hRequest = 0;
+        }
+        if (state.hConnect != 0) {
+          WinHttpCloseHandle(state.hConnect);
+          state.hConnect = 0;
+        }
+      }
+    };
+
+    // Allocate body buffer — must survive until SENDREQUEST_COMPLETE.
+    if (body.isNotEmpty) {
+      state.bodyBuffer = calloc<Uint8>(body.length);
+      state.bodyBuffer.asTypedList(body.length).setAll(0, body);
+      state.bodyLength = body.length;
+    }
+
+    // Send request (async — returns immediately).
+    try {
+      callWinHttpAsync(
+        'WinHttpSendRequest',
+        () => WinHttpSendRequest(
+          hRequest,
+          nullptr,
+          0,
+          body.isNotEmpty ? state.bodyBuffer.cast() : nullptr,
+          body.length,
+          body.length,
+          contextId,
+        ),
+      );
+    } catch (_) {
+      dispatcher.initiateCleanup(state);
+      _pendingRequests--;
+      rethrow;
+    }
+
+    // Wire up abort — closing the handle cancels pending async operations.
+    if (request case Abortable(:final abortTrigger?)) {
+      unawaited(abortTrigger.whenComplete(() {
+        if (state.aborted) return;
+        state.aborted = true;
+        final error = RequestAbortedException(request.url);
+        if (!state.headersCompleter.isCompleted) {
+          state.headersCompleter.completeError(error);
+        } else if (!state.bodyController.isClosed) {
+          state.bodyController.addError(error);
+          state.bodyController.close();
+        }
+        dispatcher.initiateCleanup(state);
+      }));
+    }
+
+    // Wait for headers (completes when HEADERS_AVAILABLE fires).
+    final RawResponseHeaders rawHeaders;
+    try {
+      rawHeaders = await state.headersCompleter.future;
+    } catch (_) {
+      _pendingRequests--;
+      unawaited(state.bodyController.close());
+      rethrow;
+    }
+
+    // Track body stream completion for session lifecycle.
+    unawaited(state.bodyController.done.then((_) {
       _pendingRequests--;
       _maybeCloseSession();
     }, onError: (_) {
@@ -273,8 +370,12 @@ class WinHttpClient extends BaseClient {
       _maybeCloseSession();
     }));
 
+    final statusCode = rawHeaders.statusCode;
+    final isRedirect =
+        !request.followRedirects && statusCode >= 300 && statusCode < 400;
+
     return _StreamedResponseWithUrl(
-      responseController.stream,
+      state.bodyController.stream,
       rawHeaders.statusCode,
       url: rawHeaders.finalUrl,
       contentLength: rawHeaders.contentLength,
@@ -284,8 +385,6 @@ class WinHttpClient extends BaseClient {
       headers: rawHeaders.headers,
     );
   }
-
-  bool _closePending = false;
 
   @override
   void close() {
@@ -297,6 +396,15 @@ class WinHttpClient extends BaseClient {
     if (_closePending && _pendingRequests <= 0 && _hSession != null) {
       WinHttpCloseHandle(_hSession!);
       _hSession = null;
+      // WinHTTP fires final callbacks (HANDLE_CLOSING) from its thread pool
+      // after handles are closed. Delay closing the NativeCallable to let
+      // these drain. The callback ignores them (unknown context), but the
+      // native function pointer must remain valid.
+      final dispatcher = _dispatcher;
+      _dispatcher = null;
+      Future.delayed(const Duration(seconds: 2), () {
+        dispatcher?.close();
+      });
     }
   }
 }

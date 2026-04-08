@@ -51,3 +51,19 @@ int callWinHttp(String functionName, int Function() call) {
   }
   return result;
 }
+
+/// Calls a WinHTTP async function, capturing GetLastError immediately after.
+///
+/// In async mode, functions return FALSE with GetLastError() == ERROR_IO_PENDING
+/// to indicate the operation was queued — this is not an error.
+/// Throws [WinHttpException] only for real failures.
+void callWinHttpAsync(String functionName, int Function() call) {
+  SetLastError(0);
+  final result = call();
+  if (result == 0) {
+    final lastError = GetLastError();
+    if (lastError != ERROR_IO_PENDING) {
+      throw WinHttpException(lastError, functionName);
+    }
+  }
+}

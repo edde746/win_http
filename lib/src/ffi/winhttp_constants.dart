@@ -9,6 +9,10 @@ const int WINHTTP_ACCESS_TYPE_NAMED_PROXY = 3;
 // ignore: constant_identifier_names
 const int WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY = 4; // Recommended on 8.1+
 
+// Flag for WinHttpOpen — enables asynchronous mode.
+// ignore: constant_identifier_names
+const int WINHTTP_FLAG_ASYNC = 0x10000000;
+
 // Flag constants for WinHttpOpenRequest.
 // ignore: constant_identifier_names
 const int WINHTTP_FLAG_SECURE = 0x00800000;
@@ -68,11 +72,48 @@ const int WINHTTP_DISABLE_REDIRECTS = 0x00000002;
 const int INTERNET_DEFAULT_HTTP_PORT = 80;
 // ignore: constant_identifier_names
 const int INTERNET_DEFAULT_HTTPS_PORT = 443;
+// Async callback status constants for WinHttpSetStatusCallback.
+// Values from winhttp.h in the Windows SDK.
+// ignore: constant_identifier_names
+const int WINHTTP_CALLBACK_STATUS_HANDLE_CLOSING = 0x00000800;
+// ignore: constant_identifier_names
+const int WINHTTP_CALLBACK_STATUS_REDIRECT = 0x00004000;
+// ignore: constant_identifier_names
+const int WINHTTP_CALLBACK_STATUS_HEADERS_AVAILABLE = 0x00020000;
+// ignore: constant_identifier_names
+const int WINHTTP_CALLBACK_STATUS_DATA_AVAILABLE = 0x00040000;
+// ignore: constant_identifier_names
+const int WINHTTP_CALLBACK_STATUS_READ_COMPLETE = 0x00080000;
+// ignore: constant_identifier_names
+const int WINHTTP_CALLBACK_STATUS_WRITE_COMPLETE = 0x00100000;
+// ignore: constant_identifier_names
+const int WINHTTP_CALLBACK_STATUS_REQUEST_ERROR = 0x00200000;
+// ignore: constant_identifier_names
+const int WINHTTP_CALLBACK_STATUS_SENDREQUEST_COMPLETE = 0x00400000;
+
+// Bitmask to subscribe to all completion/error/redirect/close notifications.
+// ignore: constant_identifier_names
+const int WINHTTP_CALLBACK_FLAG_ALL_COMPLETIONS =
+    WINHTTP_CALLBACK_STATUS_SENDREQUEST_COMPLETE |
+    WINHTTP_CALLBACK_STATUS_HEADERS_AVAILABLE |
+    WINHTTP_CALLBACK_STATUS_DATA_AVAILABLE |
+    WINHTTP_CALLBACK_STATUS_READ_COMPLETE |
+    WINHTTP_CALLBACK_STATUS_WRITE_COMPLETE |
+    WINHTTP_CALLBACK_STATUS_REQUEST_ERROR |
+    WINHTTP_CALLBACK_STATUS_REDIRECT |
+    WINHTTP_CALLBACK_STATUS_HANDLE_CLOSING;
+
+// Sentinel return value for WinHttpSetStatusCallback failure.
+// ignore: constant_identifier_names
+const int WINHTTP_INVALID_STATUS_CALLBACK = -1;
+
 // Win32 error codes.
 // ignore: constant_identifier_names
 const int ERROR_SUCCESS = 0;
 // ignore: constant_identifier_names
 const int ERROR_INSUFFICIENT_BUFFER = 122;
+// ignore: constant_identifier_names
+const int ERROR_IO_PENDING = 997;
 
 // WinHTTP error codes.
 // ignore: constant_identifier_names

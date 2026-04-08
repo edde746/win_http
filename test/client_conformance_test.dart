@@ -15,7 +15,7 @@ void main() {
       canReceiveSetCookieHeaders: true,
       canSendCookieHeaders: true,
       supportsFoldedHeaders: false, // WinHTTP unfolds headers internally
-      supportsAbort: false,
+      supportsAbort: true,
     );
   });
 
@@ -30,7 +30,7 @@ void main() {
       canReceiveSetCookieHeaders: true,
       canSendCookieHeaders: true,
       supportsFoldedHeaders: false,
-      supportsAbort: false,
+      supportsAbort: true,
     );
   });
 }
