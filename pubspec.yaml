@@ -3,7 +3,7 @@ description: >-
   A Windows HTTP client for package:http using the native WinHTTP API.
   Provides system proxy support, Schannel TLS, and automatic decompression.
   Requires Windows 8.1+.
-version: 0.1.0
+version: 0.2.0
 repository: https://github.com/edde746/win_http
 topics:
   - http
