@@ -7,6 +7,7 @@ import 'package:http/http.dart';
 import 'ffi/winhttp_bindings.dart';
 import 'ffi/winhttp_constants.dart';
 import 'native_memory.dart';
+import 'request_error_message.dart';
 import 'string_utils.dart';
 import 'win_http_api.dart';
 import 'win_http_exception.dart';

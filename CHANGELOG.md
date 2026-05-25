@@ -1,3 +1,10 @@
+## 0.2.1
+
+- Fixed async request error reporting so WinHTTP-owned callback pointers are
+  not read after `NativeCallable.listener` dispatch.
+- Request failures now report safe inferred DNS, connection, response, and TLS
+  messages instead of bogus native error codes from stale callback memory.
+
 ## 0.2.0
 
 - **Breaking**: Migrated from sync WinHTTP + isolates to async WinHTTP callbacks.

@@ -8,22 +8,11 @@ import 'package:http/http.dart';
 import 'ffi/winhttp_bindings.dart';
 import 'ffi/winhttp_constants.dart';
 import 'native_memory.dart';
+import 'request_error_message.dart';
 import 'win_http_exception.dart';
 
 const _readBufferSize = 64 * 1024;
 final _digitRegex = RegExp(r'^\d+$');
-
-// ---------------------------------------------------------------------------
-// Request lifecycle phases
-// ---------------------------------------------------------------------------
-
-enum RequestPhase {
-  sendingRequest,
-  receivingResponse,
-  readingData,
-  done,
-  error,
-}
 
 // ---------------------------------------------------------------------------
 // Per-request async state
@@ -37,6 +26,7 @@ class AsyncRequestState {
   final BaseRequest request;
 
   RequestPhase phase = RequestPhase.sendingRequest;
+  RequestProgress progress = RequestProgress.initial;
 
   final Completer<RawResponseHeaders> headersCompleter =
       Completer<RawResponseHeaders>();
@@ -52,6 +42,7 @@ class AsyncRequestState {
   int totalBytesRead = 0;
   int? contentLength;
   bool aborted = false;
+  bool secureFailure = false;
 
   /// Callback invoked when the body stream subscription is cancelled.
   void Function()? onStreamCancel;
@@ -163,6 +154,24 @@ class AsyncCallbackDispatcher {
     if (state == null || state.aborted) return;
 
     switch (dwInternetStatus) {
+      case WINHTTP_CALLBACK_STATUS_RESOLVING_NAME:
+        state.progress = RequestProgress.resolvingName;
+      case WINHTTP_CALLBACK_STATUS_NAME_RESOLVED:
+        state.progress = RequestProgress.nameResolved;
+      case WINHTTP_CALLBACK_STATUS_CONNECTING_TO_SERVER:
+        state.progress = RequestProgress.connectingToServer;
+      case WINHTTP_CALLBACK_STATUS_CONNECTED_TO_SERVER:
+        state.progress = RequestProgress.connectedToServer;
+      case WINHTTP_CALLBACK_STATUS_SENDING_REQUEST:
+        state.progress = RequestProgress.sendingRequest;
+      case WINHTTP_CALLBACK_STATUS_REQUEST_SENT:
+        state.progress = RequestProgress.requestSent;
+      case WINHTTP_CALLBACK_STATUS_RECEIVING_RESPONSE:
+        state.progress = RequestProgress.receivingResponse;
+      case WINHTTP_CALLBACK_STATUS_RESPONSE_RECEIVED:
+        state.progress = RequestProgress.responseReceived;
+      case WINHTTP_CALLBACK_STATUS_SECURE_FAILURE:
+        state.secureFailure = true;
       case WINHTTP_CALLBACK_STATUS_SENDREQUEST_COMPLETE:
         _onSendRequestComplete(state);
       case WINHTTP_CALLBACK_STATUS_HEADERS_AVAILABLE:
@@ -174,7 +183,7 @@ class AsyncCallbackDispatcher {
       case WINHTTP_CALLBACK_STATUS_READ_COMPLETE:
         _onReadComplete(state, dwStatusInformationLength);
       case WINHTTP_CALLBACK_STATUS_REQUEST_ERROR:
-        _onRequestError(state, lpvStatusInformation, dwStatusInformationLength);
+        _onRequestError(state);
       case WINHTTP_CALLBACK_STATUS_HANDLE_CLOSING:
         _requests.remove(dwContext);
       // REDIRECT, WRITE_COMPLETE: no action needed
@@ -190,6 +199,7 @@ class AsyncCallbackDispatcher {
 
     // Initiate response reception.
     state.phase = RequestPhase.receivingResponse;
+    state.progress = RequestProgress.receivingResponse;
     try {
       callWinHttpAsync(
         'WinHttpReceiveResponse',
@@ -211,11 +221,9 @@ class AsyncCallbackDispatcher {
       final rawHeaders =
           queryHeaderString(state.hRequest, WINHTTP_QUERY_RAW_HEADERS_CRLF);
       final headers = _parseRawHeaders(rawHeaders ?? '');
-      final finalUrlStr =
-          queryOptionString(state.hRequest, WINHTTP_OPTION_URL);
-      final finalUrl = finalUrlStr != null
-          ? Uri.parse(finalUrlStr)
-          : state.request.url;
+      final finalUrlStr = queryOptionString(state.hRequest, WINHTTP_OPTION_URL);
+      final finalUrl =
+          finalUrlStr != null ? Uri.parse(finalUrlStr) : state.request.url;
 
       int? contentLength;
       final clHeader = headers['content-length'];
@@ -239,6 +247,7 @@ class AsyncCallbackDispatcher {
 
       // Start reading body.
       state.phase = RequestPhase.readingData;
+      state.progress = RequestProgress.readingData;
       state.readBuffer = calloc<Uint8>(_readBufferSize);
       _issueRead(state);
     } on WinHttpException catch (e) {
@@ -269,23 +278,12 @@ class AsyncCallbackDispatcher {
     }
   }
 
-  void _onRequestError(AsyncRequestState state,
-      Pointer<Void> lpvStatusInformation, int dwStatusInformationLength) {
-    // Best-effort read of WINHTTP_ASYNC_RESULT — the pointer may be dangling
-    // since NativeCallable.listener runs asynchronously. In practice it's
-    // usually still valid due to timing.
-    var errorCode = 0;
-    try {
-      if (dwStatusInformationLength >= sizeOf<WINHTTP_ASYNC_RESULT>() &&
-          lpvStatusInformation != nullptr) {
-        final result = lpvStatusInformation.cast<WINHTTP_ASYNC_RESULT>().ref;
-        errorCode = result.dwError;
-      }
-    } catch (_) {
-      // Pointer was invalid — use phase-based fallback.
-    }
-
-    final message = _errorMessageForCode(errorCode, state.phase);
+  void _onRequestError(AsyncRequestState state) {
+    final message = requestErrorMessage(
+      phase: state.phase,
+      progress: state.progress,
+      secureFailure: state.secureFailure,
+    );
     _completeWithError(state, message);
   }
 
@@ -315,27 +313,6 @@ class AsyncCallbackDispatcher {
       state.bodyController.close();
     }
     initiateCleanup(state);
-  }
-
-  static String _errorMessageForCode(int errorCode, RequestPhase phase) {
-    if (errorCode != 0) {
-      return switch (errorCode) {
-        ERROR_WINHTTP_TIMEOUT => 'Connection timed out',
-        ERROR_WINHTTP_NAME_NOT_RESOLVED => 'Could not resolve host',
-        ERROR_WINHTTP_CANNOT_CONNECT => 'Connection refused',
-        ERROR_WINHTTP_REDIRECT_FAILED => 'Redirect limit exceeded',
-        ERROR_WINHTTP_CONNECTION_ERROR =>
-          'The connection was reset or terminated',
-        ERROR_WINHTTP_SECURE_FAILURE => 'TLS certificate validation failed',
-        _ => 'WinHTTP error $errorCode (0x${errorCode.toRadixString(16)})',
-      };
-    }
-    return switch (phase) {
-      RequestPhase.sendingRequest => 'Failed to send request',
-      RequestPhase.receivingResponse => 'Failed to receive response',
-      RequestPhase.readingData => 'Connection closed while receiving data',
-      _ => 'WinHTTP request failed',
-    };
   }
 }
 
