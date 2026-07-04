@@ -1,3 +1,10 @@
+## 0.2.2
+
+- Enabled `WINHTTP_OPTION_IPV6_FAST_FALLBACK` (Happy Eyeballs) on the session
+  so dual-stack hosts with an unreachable IPv6 route fall back to IPv4 within
+  milliseconds instead of stalling until the IPv6 connect times out
+  (Windows 10 2004+, silent fallback on older versions).
+
 ## 0.2.1
 
 - Fixed async request error reporting so WinHTTP-owned callback pointers are

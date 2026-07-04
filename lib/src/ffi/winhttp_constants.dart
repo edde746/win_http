@@ -78,6 +78,10 @@ const int WINHTTP_OPTION_ENABLE_HTTP_PROTOCOL = 133;
 // ignore: constant_identifier_names
 const int WINHTTP_PROTOCOL_FLAG_HTTP2 = 0x1;
 
+// Enables Happy Eyeballs-style IPv6 -> IPv4 fast fallback (Windows 10 2004+).
+// ignore: constant_identifier_names
+const int WINHTTP_OPTION_IPV6_FAST_FALLBACK = 140;
+
 // Max connections per server (default is 6 for HTTP/1.1).
 // ignore: constant_identifier_names
 const int WINHTTP_OPTION_MAX_CONNS_PER_SERVER = 73;

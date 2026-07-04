@@ -168,6 +168,12 @@ class WinHttpClient extends BaseClient {
     trySetOption(hSession, WINHTTP_OPTION_ENABLE_HTTP_PROTOCOL,
         WINHTTP_PROTOCOL_FLAG_HTTP2);
 
+    // Fast IPv6 -> IPv4 fallback for dual-stack hosts with broken IPv6
+    // (Happy Eyeballs). Without this, WinHTTP tries resolved addresses
+    // sequentially and a blackholed IPv6 route stalls the connect for
+    // many seconds. Silent fallback before Windows 10 2004.
+    trySetOption(hSession, WINHTTP_OPTION_IPV6_FAST_FALLBACK, 1);
+
     // Increase max connections per server if configured.
     if (config.maxConnectionsPerServer != null) {
       trySetOption(hSession, WINHTTP_OPTION_MAX_CONNS_PER_SERVER,
